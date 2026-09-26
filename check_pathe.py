@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Surveillance des séances Pathé pour le cinéma Brumath.
-Détecte la disponibilité et envoie un email uniquement lors de la transition indisponible -> disponible.
+Surveillance de la page événement Pathé "Dune - Troisième partie : Projection IMAX 70mm"
+au Pathé Odysseum (Montpellier, seule salle IMAX 70mm de France).
+Envoie un email uniquement lors de la transition indisponible -> disponible.
+
+Adapté du script original https://github.com/SATHEESHPRASHANTH/pathe-alert
 """
 
 import os
@@ -14,10 +17,11 @@ from email.mime.multipart import MIMEMultipart
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
 
 # --- Constantes ---
-FILM_NAME = "Avatar : de feu et de cendres"
-FILM_URL = "https://www.pathe.fr/films/avatar-de-feu-et-de-cendres-11387"
-CINEMA_KEYWORD = "Brumath"
-CINEMA_URL = "https://www.pathe.fr/cinemas/cinema-pathe-brumath"
+FILM_NAME = "Dune - Troisième partie : Projection IMAX 70mm"
+FILM_URL = "https://www.pathe.fr/evenements/dune-troisieme-partie-projection-imax-70mm-55289/"
+CINEMA_KEYWORD = "Odysseum"  # seul cinéma français équipé d'un projecteur IMAX 70mm
+CINEMA_URL = FILM_URL  # on surveille directement la page de l'événement
+
 STATE_FILE = "state.json"
 
 # --- SMTP Brevo ---
@@ -48,47 +52,19 @@ def write_state(state: dict) -> None:
         log(f"❌ Impossible d'écrire {STATE_FILE}: {e}")
 
 
-def accept_cookies(page) -> None:
-    """
-    Essaie de fermer/valider le bandeau cookies Pathé.
-    Ne plante jamais si absent.
-    """
-    candidates = [
-        ("button", r"Tout accepter"),
-        ("button", r"Accepter( et fermer)?"),
-        ("button", r"J'?accepte"),
-        ("button", r"Continuer"),
-        ("button", r"OK"),
-        ("button", r"Fermer"),
-        ("link", r"Tout accepter"),
-        ("link", r"Accepter"),
-    ]
-
-    for _ in range(3):
-        for role, pattern in candidates:
-            try:
-                page.get_by_role(role, name=re.compile(pattern, re.I)).click(timeout=1500)
-                log("🍪 Cookies acceptés/fermés")
-                page.wait_for_timeout(400)
-                return
-            except Exception:
-                pass
-        page.wait_for_timeout(700)
-
-
 def check_availability() -> tuple[bool, dict]:
     """
-    Stratégie simple:
-    - Ouvre CINEMA_URL
-    - Accepte cookies
-    - Essaie de cliquer 'Aujourd'hui' / 'Demain' si dispo
-    - Récupère HTML (page.content) + texte (inner_text)
-    - Détecte FILM_NAME (en version 'avatar' pour test) + horaires HH:MM
+    - Ouvre CINEMA_URL (la page événement Dune 3 IMAX 70mm)
+    - Accepte les cookies
+    - Récupère HTML + texte
+    - Détecte le mot-clé du cinéma (Odysseum) + un signal de réservation
+      (réserver / e-billet / billetterie / acheter) OU un horaire HH:MM
     """
     import unicodedata
 
     debug_info = {
-        "film_found": False,
+        "cinema_found": False,
+        "reservation_signal": False,
         "nb_horaires": 0,
         "error": None,
         "used": [],
@@ -125,30 +101,23 @@ def check_availability() -> tuple[bool, dict]:
             page = context.new_page()
             page.set_default_timeout(60000)
 
-            log(f"🏢 Ouverture cinéma: {CINEMA_URL}")
+            log(f"🎬 Ouverture page événement: {CINEMA_URL}")
             page.goto(CINEMA_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
+
             accept_cookies(page)
 
-            # Petites actions pour forcer le rendu des séances (si boutons présents)
-            for label in ["Aujourd'hui", "Demain"]:
-                try:
-                    page.get_by_role("button", name=re.compile(label, re.I)).click(timeout=2000)
-                    debug_info["used"].append(f"click:{label}")
-                    page.wait_for_timeout(1200)
-                except Exception:
-                    pass
-
-            # Scroll pour charger lazy content
+            # Scroll pour charger le contenu en lazy-load (liste des cinémas)
             try:
-                page.mouse.wheel(0, 2500)
+                page.mouse.wheel(0, 3000)
                 debug_info["used"].append("scroll")
+                page.wait_for_timeout(1500)
+                page.mouse.wheel(0, 3000)
             except Exception:
                 pass
 
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(3000)
 
-            # Récupère HTML + texte
             html = page.content()
             debug_info["used"].append("page.content")
             try:
@@ -162,27 +131,31 @@ def check_availability() -> tuple[bool, dict]:
         html_n = normalize(html)
         text_n = normalize(text)
 
-        # Détection film (pour être robuste, on utilise au moins le mot "avatar" ici)
-        # Quand tu passeras à Jana Nayagan, on mettra un mot-clé stable.
-        film_key = normalize(FILM_NAME)
-        # fallback ultra robuste: au moins "avatar" (pour ton test actuel)
-        fallback_keys = ["avatar", "feu", "cendres"]
+        # Le cinéma qui nous intéresse
+        cinema_key = normalize(CINEMA_KEYWORD)
+        cinema_found = (cinema_key in html_n) or (cinema_key in text_n)
+        debug_info["cinema_found"] = cinema_found
 
-        film_found = (film_key in html_n) or (film_key in text_n) or any(k in html_n for k in fallback_keys) or any(k in text_n for k in fallback_keys)
-        debug_info["film_found"] = film_found
+        # Signal de réservation
+        reservation_keywords = ["reserver", "e-billet", "e billet", "billetterie", "acheter"]
+        reservation_signal = any(k in html_n for k in reservation_keywords) or any(
+            k in text_n for k in reservation_keywords
+        )
+        debug_info["reservation_signal"] = reservation_signal
 
-        # Horaires HH:MM (dans HTML ou texte)
+        # Horaires HH:MM
         horaire_pattern = r"\b(?:[01]\d|2[0-3]):[0-5]\d\b"
         times_html = re.findall(horaire_pattern, html_n)
         times_text = re.findall(horaire_pattern, text_n)
-
-        # On combine (sans double compter)
         all_times = list(dict.fromkeys(times_html + times_text))
         debug_info["nb_horaires"] = len(all_times)
 
-        available = film_found and debug_info["nb_horaires"] > 0
+        available = cinema_found and (reservation_signal or debug_info["nb_horaires"] > 0)
 
-        log(f"🔎 film_found={film_found} | nb_horaires={debug_info['nb_horaires']} | available={available} | used={debug_info['used']}")
+        log(
+            f"🔎 cinema_found={cinema_found} | reservation_signal={reservation_signal} "
+            f"| nb_horaires={debug_info['nb_horaires']} | available={available} | used={debug_info['used']}"
+        )
         return available, debug_info
 
     except PlaywrightTimeoutError as e:
@@ -199,10 +172,10 @@ def send_email_brevo(subject: str, body: str) -> bool:
     smtp_user = os.environ.get("BREVO_SMTP_USER")
     smtp_pass = os.environ.get("BREVO_SMTP_KEY")
     from_email = os.environ.get("BREVO_FROM_EMAIL")
-    to_email = os.environ.get("ALERT_TO_EMAIL", "satheeshprashanth2002@gmail.com")
+    to_email = os.environ.get("ALERT_TO_EMAIL")
 
     if not all([smtp_user, smtp_pass, from_email, to_email]):
-        log("❌ Variables SMTP manquantes")
+        log("❌ Variables SMTP manquantes (vérifie les secrets GitHub)")
         return False
 
     msg = MIMEMultipart()
@@ -233,16 +206,15 @@ def main():
     new_status = "available" if available else "unavailable"
 
     if new_status == "available" and last_status != "available":
-        subject = f"🎬 Pathé Brumath: séances dispo - {FILM_NAME}"
+        subject = f"🎬 Dune 3 IMAX 70mm dispo à Pathé {CINEMA_KEYWORD} !"
         body = (
             f"Film: {FILM_NAME}\n"
             f"Cinéma: Pathé {CINEMA_KEYWORD}\n"
-            f"URL film: {FILM_URL}\n"
-            f"URL cinéma: {CINEMA_URL}\n\n"
+            f"URL: {FILM_URL}\n\n"
             f"Détails:\n"
-            f"- film_found_on_cinema_page: {debug.get('film_found_on_cinema_page')}\n"
-            f"- reservation_signal: {debug['reservation_signal']}\n"
-            f"- nb_horaires: {debug['nb_horaires']}\n"
+            f"- cinema_found: {debug.get('cinema_found')}\n"
+            f"- reservation_signal: {debug.get('reservation_signal')}\n"
+            f"- nb_horaires: {debug.get('nb_horaires')}\n"
             f"- error: {debug.get('error')}\n\n"
             f"Date (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
@@ -253,7 +225,6 @@ def main():
     state["last_status"] = new_status
     state["last_seen_at"] = datetime.now(timezone.utc).isoformat()
     write_state(state)
-
     log("===== END =====")
 
 
