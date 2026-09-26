@@ -150,7 +150,7 @@ def check_availability() -> tuple[bool, dict]:
         all_times = list(dict.fromkeys(times_html + times_text))
         debug_info["nb_horaires"] = len(all_times)
 
-        available = True # test
+        available = cinema_found and (reservation_signal or debug_info["nb_horaires"] > 0)
 
         log(
             f"🔎 cinema_found={cinema_found} | reservation_signal={reservation_signal} "
